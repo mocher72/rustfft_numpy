@@ -1,0 +1,7 @@
+/target/
+/wheels/
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+*.egg-info/

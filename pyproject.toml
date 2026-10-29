@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rustfft-numpy"
+version = "0.1.0"
+description = "NumPy-style FFT functions backed by RustFFT"
+requires-python = ">=3.12"
+dependencies = ["numpy>=2.5.2,<2.6"]
+
+[tool.maturin]
+python-source = "."
+module-name = "rustfft_numpy._core"
+features = ["pyo3/extension-module"]
