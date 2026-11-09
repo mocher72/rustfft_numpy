@@ -4,6 +4,12 @@ A separate Python package that aims to mirror the `numpy.fft` API while using
 RustFFT for its transforms. It returns NumPy arrays; it does not replace or
 modify `numpy.fft`.
 
+The RustFFT backend runs on the CPU. FFT inputs are converted with
+`numpy.asarray(..., device="cpu")`, so an input that cannot be represented on
+the CPU raises an error instead of being silently copied from another device.
+`fftfreq` and `rfftfreq` accept NumPy's `device` keyword and support `None` or
+`"cpu"`.
+
 The compatibility target is NumPy 2.5.2, Python 3.12, and the
 `separ` environment. The package uses PyO3 and rust-numpy to cross the Python / Rust
 boundary. RustFFT plans are cached by transform length, direction, and precision.
@@ -27,6 +33,21 @@ native runs. The benchmark writes a uniquely named
 `benchmarks/results-<os>-<architecture>-<host>.csv` file and records CPU,
 operating system, Python, NumPy, and SciPy metadata. Copy result CSVs from each
 machine into the same `benchmarks` directory to compare them in one notebook.
+
+When PyTorch is installed, the benchmark also measures `torch.fft` on the CPU
+and on CUDA when available. It adds VkFFT and cuFFT when `pyvkfft` and CuPy
+with a working CUDA backend are available. Install the CuPy package that
+matches your CUDA toolkit and `pyvkfft` (for example, `cupy-cuda13x` for CUDA
+13). GPU implementations use GPU events after a one-time host-to-device input
+transfer; their reported times exclude data transfer and are marked
+`device_resident` in the CSV, so compare them separately from CPU timings. For
+CUDA FFTs, PyTorch uses cuFFT, so `torch.fft` CUDA and cuFFT/CuPy compare two
+interfaces to the same underlying FFT library; differences include wrapper
+and plan-management overhead.
+The benchmark also runs a batched FFT sweep with roughly 8 million complex
+values per call and records both full-batch latency and microseconds per FFT.
+When running in Docker, set `BENCHMARK_DOCKER_IMAGE` to the image tag so the
+CSV records it alongside the CUDA and PyTorch versions.
 
 Example:
 

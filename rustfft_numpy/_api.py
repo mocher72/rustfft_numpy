@@ -8,6 +8,11 @@ import numpy as np
 from . import _core
 
 
+def _asarray(a):
+    """Convert to a NumPy array on the CPU, rejecting implicit device copies."""
+    return np.asarray(a, device="cpu")
+
+
 def _index(value, name):
     try:
         return operator.index(value)
@@ -52,7 +57,7 @@ def _resize(x, axis, n):
         return x
     shape = list(x.shape)
     shape[axis] = n
-    out = np.zeros(shape, dtype=x.dtype)
+    out = np.zeros(shape, dtype=x.dtype, device="cpu")
     take = min(old, n)
     if take:
         src = [slice(None)] * x.ndim
@@ -116,7 +121,7 @@ def _axes_and_sizes(ndim, shape, axes, default_axes=None):
 
 
 def _complex_nd(a, shape, axes, inverse, norm):
-    x = np.asarray(a)
+    x = _asarray(a)
     axes, sizes = _axes_and_sizes(x.ndim, shape, axes)
     dtype = _complex_dtype(x.dtype)
     x = x.astype(dtype, copy=False)
@@ -139,7 +144,7 @@ def _return(result, out):
 
 
 def fft(a, n=None, axis=-1, norm=None, out=None):
-    x = np.asarray(a)
+    x = _asarray(a)
     axis = _index(axis, "axis")
     if axis < -x.ndim or axis >= x.ndim:
         raise np.exceptions.AxisError(axis, ndim=x.ndim)
@@ -150,7 +155,7 @@ def fft(a, n=None, axis=-1, norm=None, out=None):
 
 
 def ifft(a, n=None, axis=-1, norm=None, out=None):
-    x = np.asarray(a)
+    x = _asarray(a)
     axis = _index(axis, "axis")
     if axis < -x.ndim or axis >= x.ndim:
         raise np.exceptions.AxisError(axis, ndim=x.ndim)
@@ -177,7 +182,7 @@ def ifft2(a, s=None, axes=(-2, -1), norm=None, out=None):
 
 
 def rfft(a, n=None, axis=-1, norm=None, out=None):
-    x = np.asarray(a)
+    x = _asarray(a)
     if x.dtype.kind == "c":
         raise TypeError("rfft input must be real")
     axis = _index(axis, "axis")
@@ -198,7 +203,7 @@ def rfft(a, n=None, axis=-1, norm=None, out=None):
 
 
 def irfft(a, n=None, axis=-1, norm=None, out=None):
-    x = np.asarray(a)
+    x = _asarray(a)
     axis = _index(axis, "axis")
     if axis < -x.ndim or axis >= x.ndim:
         raise np.exceptions.AxisError(axis, ndim=x.ndim)
@@ -214,7 +219,7 @@ def irfft(a, n=None, axis=-1, norm=None, out=None):
     x = _resize(x, axis, half)
     full_shape = list(x.shape)
     full_shape[axis] = n
-    full = np.zeros(full_shape, dtype=ctype)
+    full = np.zeros(full_shape, dtype=ctype, device="cpu")
     idx_src = [slice(None)] * x.ndim
     idx_dst = [slice(None)] * full.ndim
     idx_src[axis] = slice(0, half)
@@ -232,7 +237,7 @@ def irfft(a, n=None, axis=-1, norm=None, out=None):
 
 
 def rfftn(a, s=None, axes=None, norm=None, out=None):
-    x = np.asarray(a)
+    x = _asarray(a)
     if x.dtype.kind == "c":
         raise TypeError("rfftn input must be real")
     axes, sizes = _axes_and_sizes(x.ndim, s, axes)
@@ -257,7 +262,7 @@ def rfftn(a, s=None, axes=None, norm=None, out=None):
 
 
 def irfftn(a, s=None, axes=None, norm=None, out=None):
-    x = np.asarray(a)
+    x = _asarray(a)
     axes, sizes = _axes_and_sizes(x.ndim, s, axes)
     if not axes:
         return _return(x.copy(), out)
@@ -278,7 +283,7 @@ def irfftn(a, s=None, axes=None, norm=None, out=None):
         z = _resize(z, axis, n)
     full_shape = list(z.shape)
     full_shape[real_axis] = nreal
-    full = np.zeros(full_shape, dtype=ctype)
+    full = np.zeros(full_shape, dtype=ctype, device="cpu")
     src = [slice(None)] * z.ndim
     dst = [slice(None)] * z.ndim
     src[real_axis] = slice(0, half)
@@ -309,10 +314,12 @@ def _swap_norm(norm):
 
 
 def hfft(a, n=None, axis=-1, norm=None, out=None):
+    a = _asarray(a)
     return _return(irfft(np.conjugate(a), n, axis, _swap_norm(norm)), out)
 
 
 def ihfft(a, n=None, axis=-1, norm=None, out=None):
+    a = _asarray(a)
     return _return(np.conjugate(rfft(np.conjugate(a), n, axis, _swap_norm(norm))), out)
 
 
@@ -335,8 +342,8 @@ def rfftfreq(n, d=1.0, device=None):
 
 
 def fftshift(x, axes=None):
-    return np.fft.fftshift(x, axes=axes)
+    return np.fft.fftshift(_asarray(x), axes=axes)
 
 
 def ifftshift(x, axes=None):
-    return np.fft.ifftshift(x, axes=axes)
+    return np.fft.ifftshift(_asarray(x), axes=axes)
