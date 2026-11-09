@@ -149,23 +149,59 @@ def measure_torch_gpu(fn, torch) -> tuple[float, float, float, int]:
     )
 
 
+def measure_synchronized(fn, synchronize) -> tuple[float, float, float, int]:
+    """Measure GPU calls with host timing and explicit device synchronization."""
+    fn()
+    synchronize()
+
+    def timed_batch(calls: int) -> float:
+        start = time.perf_counter()
+        for _ in range(calls):
+            result = fn()
+        synchronize()
+        elapsed = time.perf_counter() - start
+        del result
+        return elapsed * 1000.0
+
+    one_call = timed_batch(1)
+    calls = max(1, min(MAX_CALLS_PER_SAMPLE,
+                       int(TARGET_SAMPLE_SECONDS / max(one_call / 1000.0, 1e-6))))
+    per_call_ms = []
+    for _ in range(SAMPLE_COUNT):
+        gc.collect()
+        per_call_ms.append(timed_batch(calls) / calls)
+    return (
+        statistics.median(per_call_ms),
+        float(np.percentile(per_call_ms, 25)),
+        float(np.percentile(per_call_ms, 75)),
+        calls,
+    )
+
+
 def torch_backend():
-    """Return PyTorch and its CUDA device name when CUDA is available."""
+    """Return PyTorch and available CUDA/MPS devices."""
     try:
         import torch
     except ImportError as exc:
         print(f"PyTorch benchmark unavailable: {exc}", flush=True)
         return None
+    devices = []
     try:
-        device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            devices.append(("cuda", torch.cuda.get_device_name()))
     except (RuntimeError, OSError) as exc:
         print(f"PyTorch CUDA benchmark unavailable: {exc}", flush=True)
-        device_name = None
-    return torch, device_name
+    try:
+        if torch.backends.mps.is_available():
+            devices.append(("mps", "Apple MPS"))
+    except (AttributeError, RuntimeError, OSError) as exc:
+        print(f"PyTorch MPS benchmark unavailable: {exc}", flush=True)
+    return torch, devices
 
 
 def vkfft_backend():
-    """Return CuPy and its optional VkFFT entry point, or None without CUDA."""
+    """Return available VkFFT/CuPy CUDA or VkFFT/OpenCL backends."""
+    backends = []
     try:
         import cupy
         device_name = cupy.cuda.runtime.getDeviceProperties(
@@ -175,35 +211,74 @@ def vkfft_backend():
             device_name = device_name.decode()
     except (ImportError, RuntimeError, OSError) as exc:
         print(f"CuPy CUDA benchmark unavailable: {exc}", flush=True)
-        return None
+        cupy = None
+    if cupy is not None:
+        try:
+            from pyvkfft.fft import fftn
+            from pyvkfft.cuda import VkFFTApp  # confirm the CUDA extension is built
+        except (ImportError, RuntimeError, OSError) as exc:
+            print(f"VkFFT CUDA benchmark unavailable; cuFFT remains enabled: {exc}",
+                  flush=True)
+            fftn = None
+        backends.append({"kind": "cuda", "array_module": cupy, "fftn": fftn,
+                         "device_name": device_name})
+        return backends
+
     try:
+        import pyopencl as cl
+        import pyopencl.array as cla
         from pyvkfft.fft import fftn
-        from pyvkfft.cuda import VkFFTApp  # confirm the CUDA extension is built
-    except (ImportError, RuntimeError, OSError) as exc:
-        print(f"VkFFT GPU benchmark unavailable; CuPy cuFFT remains enabled: {exc}",
-              flush=True)
-        fftn = None
-    return cupy, fftn, device_name
+        from pyvkfft.opencl import VkFFTApp  # confirm the OpenCL extension is built
+        devices = [device for platform in cl.get_platforms()
+                   for device in platform.get_devices()
+                   if device.type & cl.device_type.GPU]
+        if not devices:
+            raise RuntimeError("no OpenCL GPU device found")
+        device = devices[0]
+        context = cl.Context([device])
+        queue = cl.CommandQueue(
+            context, properties=cl.command_queue_properties.PROFILING_ENABLE
+        )
+    except Exception as exc:
+        print(f"VkFFT GPU benchmark unavailable: {exc}", flush=True)
+        return backends
+    backends.append({"kind": "opencl", "array_module": cla, "fftn": fftn,
+                     "device_name": device.name, "context": context,
+                     "queue": queue})
+    return backends
 
 
-def benchmark_gpu_implementations(data: np.ndarray, cupy, vkfft_fftn,
-                                  device_name: str, n: int, frames: int,
+def benchmark_gpu_implementations(data: np.ndarray, backend,
+                                  n: int, frames: int,
                                   workload: str) -> list[dict[str, object]]:
     # Transfer happens once, outside the timed region. FFT calls and their
     # outputs remain on the GPU, matching the common iterative GPU use case.
-    gpu_data = cupy.asarray(data)
+    xp = backend["array_module"]
+    if backend["kind"] == "cuda":
+        gpu_data = xp.asarray(data)
+    else:
+        gpu_data = xp.to_device(backend["queue"], data)
     implementations = []
+    vkfft_fftn = backend["fftn"]
     if vkfft_fftn is not None:
         implementations.append(
             ("VkFFT/CuPy (GPU resident)", lambda: vkfft_fftn(gpu_data, axes=(-1,)))
+            if backend["kind"] == "cuda" else
+            ("VkFFT/OpenCL (GPU resident)", lambda: vkfft_fftn(gpu_data, axes=(-1,)))
         )
-    implementations.append(
-        ("cuFFT/CuPy (GPU resident)", lambda: cupy.fft.fft(gpu_data, axis=-1))
-    )
+    if backend["kind"] == "cuda":
+        implementations.append(
+            ("cuFFT/CuPy (GPU resident)", lambda: xp.fft.fft(gpu_data, axis=-1))
+        )
     rows = []
     for name, fn in implementations:
-        med, q1, q3, calls = measure_gpu(fn, cupy)
-        print(f"{workload} N={n:,} frames={frames} {name} [{device_name}]: "
+        if backend["kind"] == "cuda":
+            med, q1, q3, calls = measure_gpu(fn, xp)
+            timing_scope = "device_resident"
+        else:
+            med, q1, q3, calls = measure_synchronized(fn, backend["queue"].finish)
+            timing_scope = "device_synchronized_call"
+        print(f"{workload} N={n:,} frames={frames} {name} [{backend['device_name']}]: "
               f"{med:9.4f} ms (Q1 {q1:.4f}, Q3 {q3:.4f}; "
               f"{calls} calls/sample; GPU-resident)", flush=True)
         rows.append({
@@ -211,8 +286,8 @@ def benchmark_gpu_implementations(data: np.ndarray, cupy, vkfft_fftn,
             "n": n,
             "frames": frames,
             "implementation": name,
-            "device": device_name,
-            "timing_scope": "device_resident",
+            "device": backend["device_name"],
+            "timing_scope": timing_scope,
             "median_ms": med,
             "q1_ms": q1,
             "q3_ms": q3,
@@ -223,7 +298,7 @@ def benchmark_gpu_implementations(data: np.ndarray, cupy, vkfft_fftn,
     return rows
 
 
-def benchmark_torch(data: np.ndarray, torch, gpu_name: str | None,
+def benchmark_torch(data: np.ndarray, torch, gpu_devices,
                     n: int, frames: int, workload: str) -> list[dict[str, object]]:
     rows = []
     cpu_data = torch.from_numpy(data)
@@ -246,25 +321,42 @@ def benchmark_torch(data: np.ndarray, torch, gpu_name: str | None,
           f"{med:9.4f} ms (Q1 {q1:.4f}, Q3 {q3:.4f}; "
           f"{calls} calls/sample; {torch.get_num_threads()} threads)", flush=True)
 
-    if gpu_name is not None:
-        # Upload once before timing so this measures resident PyTorch CUDA FFTs.
-        gpu_data = torch.as_tensor(data, device="cuda")
+    for device_type, gpu_name in gpu_devices:
+        # Upload once before timing so this measures resident PyTorch GPU FFTs.
+        try:
+            gpu_data = torch.as_tensor(data, device=device_type)
+        except (RuntimeError, NotImplementedError) as exc:
+            print(f"PyTorch {device_type.upper()} FFT unavailable for N={n:,}: {exc}",
+                  flush=True)
+            continue
         fn = lambda: torch.fft.fft(gpu_data, dim=-1)
-        med, q1, q3, calls = measure_torch_gpu(fn, torch)
+        if device_type == "cuda":
+            med, q1, q3, calls = measure_torch_gpu(fn, torch)
+            implementation = "torch.fft (CUDA/GPU resident)"
+            timing_scope = "device_resident"
+        else:
+            try:
+                med, q1, q3, calls = measure_synchronized(fn, torch.mps.synchronize)
+            except (RuntimeError, NotImplementedError) as exc:
+                print(f"PyTorch MPS FFT unavailable for N={n:,}: {exc}", flush=True)
+                del gpu_data
+                continue
+            implementation = "torch.fft (MPS/GPU resident)"
+            timing_scope = "device_synchronized_call"
         rows.append({
             "workload": workload,
             "n": n,
             "frames": frames,
-            "implementation": "torch.fft (CUDA/GPU resident)",
+            "implementation": implementation,
             "device": gpu_name,
-            "timing_scope": "device_resident",
+            "timing_scope": timing_scope,
             "median_ms": med,
             "q1_ms": q1,
             "q3_ms": q3,
             "calls_per_sample": calls,
             "samples": SAMPLE_COUNT,
         })
-        print(f"{workload} N={n:,} frames={frames} torch.fft (CUDA) [{gpu_name}]: "
+        print(f"{workload} N={n:,} frames={frames} torch.fft ({device_type.upper()}) [{gpu_name}]: "
               f"{med:9.4f} ms (Q1 {q1:.4f}, Q3 {q3:.4f}; "
               f"{calls} calls/sample; GPU-resident)", flush=True)
         del gpu_data
@@ -277,7 +369,7 @@ def run(output: Path) -> None:
     vkfft = vkfft_backend()
     torch_info = torch_backend()
     torch = torch_info[0] if torch_info else None
-    torch_gpu_name = torch_info[1] if torch_info else None
+    torch_gpu_devices = torch_info[1] if torch_info else []
     metadata["torch_version"] = torch.__version__ if torch is not None else ""
     metadata["torch_cpu_threads"] = str(torch.get_num_threads()) if torch is not None else ""
     metadata["cuda_version"] = (
@@ -315,10 +407,10 @@ def run(output: Path) -> None:
                   f"(Q1 {q1:.4f}, Q3 {q3:.4f}; {calls} calls/sample)", flush=True)
         if torch is not None:
             rows.extend({**metadata, **row} for row in benchmark_torch(
-                data, torch, torch_gpu_name, n=n, frames=1, workload="single_fft"))
-        if vkfft is not None:
+                data, torch, torch_gpu_devices, n=n, frames=1, workload="single_fft"))
+        for backend in vkfft:
             rows.extend({**metadata, **row} for row in benchmark_gpu_implementations(
-                data, *vkfft, n=n, frames=1, workload="single_fft"))
+                data, backend, n=n, frames=1, workload="single_fft"))
         del data
 
     n = 32768
@@ -347,11 +439,11 @@ def run(output: Path) -> None:
               f"{calls} calls/sample)", flush=True)
     if torch is not None:
         rows.extend({**metadata, **row} for row in benchmark_torch(
-            data, torch, torch_gpu_name, n=n, frames=frames,
+            data, torch, torch_gpu_devices, n=n, frames=frames,
             workload="stft_frames_fft_only"))
-    if vkfft is not None:
+    for backend in vkfft:
         rows.extend({**metadata, **row} for row in benchmark_gpu_implementations(
-            data, *vkfft, n=n, frames=frames,
+            data, backend, n=n, frames=frames,
             workload="stft_frames_fft_only"))
 
     # Sweep batched 1D transforms while keeping each input batch near 64 MiB.
@@ -382,11 +474,11 @@ def run(output: Path) -> None:
                   f"(Q1 {q1:.4f}, Q3 {q3:.4f}; {calls} calls/sample)", flush=True)
         if torch is not None:
             rows.extend({**metadata, **row} for row in benchmark_torch(
-                data, torch, torch_gpu_name, n=n, frames=frames,
+                data, torch, torch_gpu_devices, n=n, frames=frames,
                 workload="batched_fft"))
-        if vkfft is not None:
+        for backend in vkfft:
             rows.extend({**metadata, **row} for row in benchmark_gpu_implementations(
-                data, *vkfft, n=n, frames=frames, workload="batched_fft"))
+                data, backend, n=n, frames=frames, workload="batched_fft"))
         del data
 
     for row in rows:

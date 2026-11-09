@@ -34,16 +34,17 @@ native runs. The benchmark writes a uniquely named
 operating system, Python, NumPy, and SciPy metadata. Copy result CSVs from each
 machine into the same `benchmarks` directory to compare them in one notebook.
 
-When PyTorch is installed, the benchmark also measures `torch.fft` on the CPU
-and on CUDA when available. It adds VkFFT and cuFFT when `pyvkfft` and CuPy
-with a working CUDA backend are available. Install the CuPy package that
-matches your CUDA toolkit and `pyvkfft` (for example, `cupy-cuda13x` for CUDA
-13). GPU implementations use GPU events after a one-time host-to-device input
-transfer; their reported times exclude data transfer and are marked
-`device_resident` in the CSV, so compare them separately from CPU timings. For
-CUDA FFTs, PyTorch uses cuFFT, so `torch.fft` CUDA and cuFFT/CuPy compare two
-interfaces to the same underlying FFT library; differences include wrapper
-and plan-management overhead.
+When PyTorch is installed, the benchmark also measures `torch.fft` on the CPU,
+CUDA, and Apple MPS when available. With a CUDA backend it adds VkFFT and cuFFT
+through PyVkFFT and CuPy. On macOS it can benchmark VkFFT through OpenCL when
+PyOpenCL and an OpenCL GPU device are available; install PyVkFFT with its OpenCL
+backend (for example, `VKFFT_BACKEND=opencl python -m pip install pyvkfft pyopencl`).
+CUDA uses GPU event timing. MPS and OpenCL use host timing with explicit device
+synchronization; all GPU paths keep inputs resident after the initial transfer.
+These timing methods are recorded in `timing_scope` and should be considered
+when comparing backends. For CUDA FFTs, PyTorch uses cuFFT, so `torch.fft` CUDA
+and cuFFT/CuPy compare two interfaces to the same underlying FFT library;
+differences include wrapper and plan-management overhead.
 The benchmark also runs a batched FFT sweep with roughly 8 million complex
 values per call and records both full-batch latency and microseconds per FFT.
 When running in Docker, set `BENCHMARK_DOCKER_IMAGE` to the image tag so the
